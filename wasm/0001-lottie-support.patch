@@ -1,0 +1,711 @@
+From cbb6121103245bf789af236efd1a44bd65976149 Mon Sep 17 00:00:00 2001
+From: Damitha Gunawardena <damitha.gunawardena@gmail.com>
+Date: Mon, 4 May 2026 06:54:44 +1000
+Subject: [PATCH 1/2] avformat/lottiedec: add Lottie JSON animation demuxer
+
+Adds a demuxer for Lottie JSON animation files (.json). It probes for
+the mandatory top-level keys w, h, fr, ip, op and a layers array, then
+exposes the animation as a single video stream using AV_CODEC_ID_LOTTIE.
+The full JSON payload is stored in codec extradata for the libthorvg
+decoder; no external library is required for demuxing.
+---
+ doc/demuxers.texi        |  11 ++
+ libavformat/Makefile     |   1 +
+ libavformat/allformats.c |   1 +
+ libavformat/lottiedec.c  | 218 +++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 231 insertions(+)
+ create mode 100644 libavformat/lottiedec.c
+
+diff --git a/doc/demuxers.texi b/doc/demuxers.texi
+index a49d3406f6..443779c732 100644
+--- a/doc/demuxers.texi
++++ b/doc/demuxers.texi
+@@ -838,6 +838,17 @@ Set the sample rate for libopenmpt to output.
+ Range is from 1000 to INT_MAX. The value default is 48000.
+ @end table
+ 
++@section lottie
++
++Demuxer for Lottie JSON animation files.
++
++Lottie is a JSON-based animation format widely used for vector animations.
++This demuxer parses the top-level animation properties (width, height, frame
++rate, in-point and out-point) and exposes the animation as a video stream.
++The full JSON is passed as extradata to the decoder.
++
++No external library is required for demuxing; decoding requires libthorvg.
++
+ @anchor{mccdec}
+ @section mcc
+ 
+diff --git a/libavformat/Makefile b/libavformat/Makefile
+index 7c2fcad93e..176d44d94d 100644
+--- a/libavformat/Makefile
++++ b/libavformat/Makefile
+@@ -352,6 +352,7 @@ OBJS-$(CONFIG_LC3_DEMUXER)               += lc3.o
+ OBJS-$(CONFIG_LC3_MUXER)                 += lc3.o
+ OBJS-$(CONFIG_LMLM4_DEMUXER)             += lmlm4.o
+ OBJS-$(CONFIG_LOAS_DEMUXER)              += loasdec.o rawdec.o
++OBJS-$(CONFIG_LOTTIE_DEMUXER)            += lottiedec.o
+ OBJS-$(CONFIG_LUODAT_DEMUXER)            += luodatdec.o
+ OBJS-$(CONFIG_LRC_DEMUXER)               += lrcdec.o lrc.o subtitles.o
+ OBJS-$(CONFIG_LRC_MUXER)                 += lrcenc.o lrc.o
+diff --git a/libavformat/allformats.c b/libavformat/allformats.c
+index a491e3a7e8..ab5a2678bd 100644
+--- a/libavformat/allformats.c
++++ b/libavformat/allformats.c
+@@ -259,6 +259,7 @@ extern const FFInputFormat  ff_lc3_demuxer;
+ extern const FFOutputFormat ff_lc3_muxer;
+ extern const FFInputFormat  ff_lmlm4_demuxer;
+ extern const FFInputFormat  ff_loas_demuxer;
++extern const FFInputFormat  ff_lottie_demuxer;
+ extern const FFInputFormat  ff_luodat_demuxer;
+ extern const FFInputFormat  ff_lrc_demuxer;
+ extern const FFOutputFormat ff_lrc_muxer;
+diff --git a/libavformat/lottiedec.c b/libavformat/lottiedec.c
+new file mode 100644
+index 0000000000..358bd02c1a
+--- /dev/null
++++ b/libavformat/lottiedec.c
+@@ -0,0 +1,218 @@
++/*
++ * Lottie JSON animation demuxer
++ * Copyright (c) 2026 Damitha Gunawardena
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * Lottie JSON animation demuxer.
++ */
++
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "avformat.h"
++#include "demux.h"
++#include "internal.h"
++#include "libavcodec/codec_id.h"
++#include "libavutil/bprint.h"
++#include "libavutil/intreadwrite.h"
++#include "libavutil/mem.h"
++
++typedef struct LottieDemuxContext {
++    int64_t cur_frame;
++    int64_t n_frames;
++} LottieDemuxContext;
++
++static double lottie_parse_key(const char *json, const char *key)
++{
++    char needle[32];
++    const char *p = json;
++    const char *layers = strstr(json, "\"layers\"");
++    size_t limit = layers ? (size_t)(layers - json) : strlen(json);
++
++    snprintf(needle, sizeof(needle), "\"%s\"", key);
++    while ((p = strstr(p, needle))) {
++        const char *q;
++        char *endp;
++        double val;
++
++        if ((size_t)(p - json) >= limit)
++            break;
++        q = p + strlen(needle);
++        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
++        if (*q != ':') { p++; continue; }
++        q++;
++        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
++        val = strtod(q, &endp);
++        if (endp != q)
++            return val;
++        p++;
++    }
++    return NAN;
++}
++
++static int lottie_probe(const AVProbeData *p)
++{
++    const char *buf = p->buf;
++    int i = 0;
++
++    while (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\r' || buf[i] == '\n')
++        i++;
++    if (buf[i] != '{')
++        return 0;
++    if (!strstr(buf, "\"layers\""))
++        return 0;
++    if (isnan(lottie_parse_key(buf, "w")))
++        return 0;
++    if (isnan(lottie_parse_key(buf, "h")))
++        return 0;
++    if (isnan(lottie_parse_key(buf, "fr")))
++        return 0;
++    if (isnan(lottie_parse_key(buf, "op")))
++        return 0;
++    if (isnan(lottie_parse_key(buf, "ip")))
++        return 0;
++
++    return AVPROBE_SCORE_MAX - 1;
++}
++
++static int lottie_read_header(AVFormatContext *s)
++{
++    LottieDemuxContext *ctx = s->priv_data;
++    AVStream *st;
++    AVCodecParameters *par;
++    AVBPrint bp;
++    double w, h, fr, ip, op;
++    int ret;
++
++    av_bprint_init(&bp, 0, AV_BPRINT_SIZE_UNLIMITED);
++    ret = avio_read_to_bprint(s->pb, &bp, INT_MAX);
++    if (ret < 0 && ret != AVERROR_EOF)
++        goto fail;
++    if (!av_bprint_is_complete(&bp)) {
++        ret = AVERROR(ENOMEM);
++        goto fail;
++    }
++    ret = 0;
++
++    w  = lottie_parse_key(bp.str, "w");
++    h  = lottie_parse_key(bp.str, "h");
++    fr = lottie_parse_key(bp.str, "fr");
++    ip = lottie_parse_key(bp.str, "ip");
++    op = lottie_parse_key(bp.str, "op");
++
++    if (isnan(w) || isnan(h) || w <= 0 || h <= 0) {
++        av_log(s, AV_LOG_ERROR, "Invalid or missing width/height.\n");
++        ret = AVERROR_INVALIDDATA;
++        goto fail;
++    }
++    if (isnan(fr) || fr <= 0) {
++        av_log(s, AV_LOG_ERROR, "Invalid or missing frame rate.\n");
++        ret = AVERROR_INVALIDDATA;
++        goto fail;
++    }
++    if (isnan(op) || op <= 0) {
++        av_log(s, AV_LOG_ERROR, "Invalid or missing out-point.\n");
++        ret = AVERROR_INVALIDDATA;
++        goto fail;
++    }
++    if (isnan(ip))
++        ip = 0;
++
++    ctx->n_frames = (int64_t)(op - ip);
++    if (ctx->n_frames <= 0) {
++        av_log(s, AV_LOG_ERROR, "Animation has no frames.\n");
++        ret = AVERROR_INVALIDDATA;
++        goto fail;
++    }
++
++    st = avformat_new_stream(s, NULL);
++    if (!st) {
++        ret = AVERROR(ENOMEM);
++        goto fail;
++    }
++
++    par             = st->codecpar;
++    par->codec_type = AVMEDIA_TYPE_VIDEO;
++    par->codec_id   = AV_CODEC_ID_LOTTIE;
++    par->width      = (int)w;
++    par->height     = (int)h;
++
++    st->avg_frame_rate = av_d2q(fr,INT_MAX);
++
++    st->nb_frames      = ctx->n_frames;
++    st->duration       = ctx->n_frames;
++    avpriv_set_pts_info(st, 64, st->avg_frame_rate.den, st->avg_frame_rate.num);
++
++    par->extradata = av_mallocz(bp.len + AV_INPUT_BUFFER_PADDING_SIZE);
++    if (!par->extradata) {
++        ret = AVERROR(ENOMEM);
++        goto fail;
++    }
++    memcpy(par->extradata, bp.str, bp.len);
++    par->extradata_size = bp.len;
++
++fail:
++    av_bprint_finalize(&bp, NULL);
++    return ret;
++}
++
++static int lottie_read_packet(AVFormatContext *s, AVPacket *pkt)
++{
++    LottieDemuxContext *ctx = s->priv_data;
++    int ret;
++
++    if (ctx->cur_frame >= ctx->n_frames)
++        return AVERROR_EOF;
++
++    if ((ret = av_new_packet(pkt, 4)) < 0)
++        return ret;
++
++    AV_WL32(pkt->data, (uint32_t)ctx->cur_frame);
++    pkt->stream_index = 0;
++    pkt->pts          = ctx->cur_frame;
++    pkt->dts          = ctx->cur_frame;
++    pkt->duration     = 1;
++    pkt->flags       |= AV_PKT_FLAG_KEY;
++    ctx->cur_frame++;
++    return 0;
++}
++
++static int lottie_read_seek(AVFormatContext *s, int stream_index,
++                            int64_t timestamp, int flags)
++{
++    LottieDemuxContext *ctx = s->priv_data;
++
++    if (timestamp < 0)
++        timestamp = 0;
++    ctx->cur_frame = FFMIN(timestamp, ctx->n_frames);
++    return 0;
++}
++
++const FFInputFormat ff_lottie_demuxer = {
++    .p.name         = "lottie",
++    .p.long_name    = NULL_IF_CONFIG_SMALL("Lottie JSON animation"),
++    .priv_data_size = sizeof(LottieDemuxContext),
++    .read_probe     = lottie_probe,
++    .read_header    = lottie_read_header,
++    .read_packet    = lottie_read_packet,
++    .read_seek      = lottie_read_seek,
++};
+-- 
+2.52.0
+
+
+From 9078f919c5c7e3d6d04d2541b55f77b40b79e514 Mon Sep 17 00:00:00 2001
+From: Damitha Gunawardena <damitha.gunawardena@gmail.com>
+Date: Mon, 4 May 2026 06:55:48 +1000
+Subject: [PATCH 2/2] avcodec/libthorvgdec: add Lottie decoder via ThorVG
+
+Wraps ThorVG C API to rasterise Lottie JSON frame by frame.
+Packets carry a 4-byte LE frame index; JSON is in extradata.
+Output: AV_PIX_FMT_RGBA. Canvas init deferred to first packet.
+Adds AV_CODEC_ID_LOTTIE and thorvg-1 pkg-config dependency.
+---
+ configure                 |   4 +
+ doc/decoders.texi         |  27 ++++
+ libavcodec/Makefile       |   1 +
+ libavcodec/allcodecs.c    |   1 +
+ libavcodec/codec_desc.c   |   8 ++
+ libavcodec/codec_id.h     |   1 +
+ libavcodec/libthorvgdec.c | 261 ++++++++++++++++++++++++++++++++++++++
+ 7 files changed, 303 insertions(+)
+ create mode 100644 libavcodec/libthorvgdec.c
+
+diff --git a/configure b/configure
+index 719642d96b..20188eabd4 100755
+--- a/configure
++++ b/configure
+@@ -271,6 +271,7 @@ External library support:
+   --enable-librav1e        enable AV1 encoding via rav1e [no]
+   --enable-librist         enable RIST via librist [no]
+   --enable-librsvg         enable SVG rasterization via librsvg [no]
++  --enable-libthorvg       enable Lottie animation via ThorVG [no]
+   --enable-librubberband   enable rubberband needed for rubberband filter [no]
+   --enable-librtmp         enable RTMP[E] support via librtmp [no]
+   --enable-libshaderc      enable runtime GLSL->SPIRV compilation via libshaderc [no]
+@@ -2124,6 +2125,7 @@ EXTERNAL_LIBRARY_LIST="
+     librav1e
+     librist
+     librsvg
++    libthorvg
+     librtmp
+     libshaderc
+     libshine
+@@ -3860,6 +3862,7 @@ libopus_encoder_deps="libopus"
+ libopus_encoder_select="audio_frame_queue"
+ librav1e_encoder_deps="librav1e"
+ librsvg_decoder_deps="librsvg"
++libthorvg_decoder_deps="libthorvg"
+ libshine_encoder_deps="libshine"
+ libshine_encoder_select="audio_frame_queue mpegaudioheader"
+ libspeex_decoder_deps="libspeex"
+@@ -7430,6 +7433,7 @@ enabled librabbitmq       && require_pkg_config librabbitmq "librabbitmq >= 0.7.
+ enabled librav1e          && require_pkg_config librav1e "rav1e >= 0.5.0" rav1e.h rav1e_context_new
+ enabled librist           && require_pkg_config librist "librist >= 0.2.7" librist/librist.h rist_receiver_create
+ enabled librsvg           && require_pkg_config librsvg librsvg-2.0 librsvg-2.0/librsvg/rsvg.h rsvg_handle_new_from_data
++enabled libthorvg         && require_pkg_config libthorvg thorvg-1 thorvg_capi.h tvg_engine_init
+ enabled librtmp           && require_pkg_config librtmp librtmp librtmp/rtmp.h RTMP_Socket
+ enabled librubberband     && require_pkg_config librubberband "rubberband >= 1.8.1" rubberband/rubberband-c.h rubberband_new -lstdc++ && append librubberband_extralibs "-lstdc++"
+ enabled libshaderc        && require_pkg_config spirv_library "shaderc >= 2019.1" shaderc/shaderc.h shaderc_compiler_initialize
+diff --git a/doc/decoders.texi b/doc/decoders.texi
+index 1db297f42f..4f3fda6407 100644
+--- a/doc/decoders.texi
++++ b/doc/decoders.texi
+@@ -146,6 +146,33 @@ This decoder allows libavcodec to decode AVS2 streams with davs2 library.
+ 
+ @c man end VIDEO DECODERS
+ 
++@anchor{libthorvg}
++@section libthorvg
++
++Lottie animation decoder using the ThorVG rendering library.
++
++libthorvg allows libavcodec to decode Lottie JSON animations by
++rasterising each frame with ThorVG's software renderer. Output is
++always @code{rgba} pixel format.
++Requires the presence of the ThorVG headers and library during configuration.
++You need to explicitly configure the build with @code{--enable-libthorvg}.
++
++@subsection Options
++
++The following options are supported by the libthorvg wrapper.
++
++@table @option
++
++@item width
++Override the output width in pixels. The default value is 0 (use the
++width declared in the animation).
++
++@item height
++Override the output height in pixels. The default value is 0 (use the
++height declared in the animation).
++
++@end table
++
+ @section libuavs3d
+ 
+ AVS3-P2/IEEE1857.10 video decoder.
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+index 85d35913f3..a397cf4a4a 100644
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -1205,6 +1205,7 @@ OBJS-$(CONFIG_LIBOPUS_ENCODER)            += libopusenc.o libopus.o     \
+                                              vorbis_data.o
+ OBJS-$(CONFIG_LIBRAV1E_ENCODER)           += librav1e.o
+ OBJS-$(CONFIG_LIBRSVG_DECODER)            += librsvgdec.o
++OBJS-$(CONFIG_LIBTHORVG_DECODER)          += libthorvgdec.o
+ OBJS-$(CONFIG_LIBSHINE_ENCODER)           += libshine.o
+ OBJS-$(CONFIG_LIBSPEEX_DECODER)           += libspeexdec.o
+ OBJS-$(CONFIG_LIBSPEEX_ENCODER)           += libspeexenc.o
+diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
+index 5e798c1430..211ebaa515 100644
+--- a/libavcodec/allcodecs.c
++++ b/libavcodec/allcodecs.c
+@@ -815,6 +815,7 @@ extern const FFCodec ff_libopus_encoder;
+ extern const FFCodec ff_libopus_decoder;
+ extern const FFCodec ff_librav1e_encoder;
+ extern const FFCodec ff_librsvg_decoder;
++extern const FFCodec ff_libthorvg_decoder;
+ extern const FFCodec ff_libshine_encoder;
+ extern const FFCodec ff_libspeex_encoder;
+ extern const FFCodec ff_libspeex_decoder;
+diff --git a/libavcodec/codec_desc.c b/libavcodec/codec_desc.c
+index a9f21f8152..86a1dc11cb 100644
+--- a/libavcodec/codec_desc.c
++++ b/libavcodec/codec_desc.c
+@@ -2009,6 +2009,14 @@ static const AVCodecDescriptor codec_descriptors[] = {
+                      AV_CODEC_PROP_LOSSLESS,
+         .mime_types= MT("image/jxs"),
+     },
++    {
++        .id        = AV_CODEC_ID_LOTTIE,
++        .type      = AVMEDIA_TYPE_VIDEO,
++        .name      = "lottie",
++        .long_name = NULL_IF_CONFIG_SMALL("Lottie JSON animation"),
++        .props     = AV_CODEC_PROP_LOSSLESS,
++        .mime_types= MT("application/json"),
++    },
+ 
+     /* various PCM "codecs" */
+     {
+diff --git a/libavcodec/codec_id.h b/libavcodec/codec_id.h
+index 6529f0a6bc..b8f54406e0 100644
+--- a/libavcodec/codec_id.h
++++ b/libavcodec/codec_id.h
+@@ -332,6 +332,7 @@ enum AVCodecID {
+     AV_CODEC_ID_APV,
+     AV_CODEC_ID_PRORES_RAW,
+     AV_CODEC_ID_JPEGXS,
++    AV_CODEC_ID_LOTTIE,
+ 
+     /* various PCM "codecs" */
+     AV_CODEC_ID_FIRST_AUDIO = 0x10000,     ///< A dummy id pointing at the start of audio codecs
+diff --git a/libavcodec/libthorvgdec.c b/libavcodec/libthorvgdec.c
+new file mode 100644
+index 0000000000..f1ac68a950
+--- /dev/null
++++ b/libavcodec/libthorvgdec.c
+@@ -0,0 +1,261 @@
++/*
++ * ThorVG Lottie animation decoder
++ * Copyright (c) 2026 Damitha Gunawardena
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * Lottie animation decoder using ThorVG.
++ */
++
++#include "avcodec.h"
++#include "codec_internal.h"
++#include "decode.h"
++#include "libavutil/intreadwrite.h"
++#include "libavutil/cpu.h"
++#include "libavutil/opt.h"
++
++#include <thorvg_capi.h>
++
++typedef struct LibThorVGContext {
++    const AVClass *class;
++    int width, height;
++
++    Tvg_Canvas    canvas;
++    Tvg_Animation animation;
++    float         total_frames;
++    int           engine_initialized;
++} LibThorVGContext;
++
++static av_cold int libthorvg_init(AVCodecContext *avctx)
++{
++    LibThorVGContext *s = avctx->priv_data;
++
++    if (!avctx->extradata || avctx->extradata_size <= 0) {
++        av_log(avctx, AV_LOG_ERROR, "Missing Lottie JSON extradata.\n");
++        return AVERROR_INVALIDDATA;
++    }
++
++    int thread_count = avctx->thread_count ? avctx->thread_count : av_cpu_count();
++    int tvg_threads = FFMIN(thread_count, 16);
++
++    av_log(avctx, AV_LOG_VERBOSE, "Initialising ThorVG with %d thread(s).\n",
++           tvg_threads);
++
++    if (tvg_engine_init(tvg_threads) != TVG_RESULT_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to initialise ThorVG engine.\n");
++        return AVERROR_EXTERNAL;
++    }
++
++    s->engine_initialized = 1;
++
++    s->animation = tvg_lottie_animation_new();
++    if (!s->animation) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to create ThorVG Lottie animation.\n");
++        return AVERROR(ENOMEM);
++    }
++
++    if (s->width  <= 0) s->width  = avctx->width;
++    if (s->height <= 0) s->height = avctx->height;
++
++    avctx->pix_fmt = AV_PIX_FMT_RGBA;
++    return 0;
++}
++
++static int libthorvg_canvas_init(AVCodecContext *avctx)
++{
++    LibThorVGContext *s = avctx->priv_data;
++    Tvg_Paint picture;
++    float pic_w = 0.f, pic_h = 0.f;
++    int ret;
++
++    picture = tvg_animation_get_picture(s->animation);
++    if (!picture) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to get ThorVG picture.\n");
++        return AVERROR_EXTERNAL;
++    }
++
++    if (tvg_picture_load_data(picture,
++                              (const char *)avctx->extradata,
++                              (uint32_t)avctx->extradata_size,
++                              "lottie+json", NULL, true)
++                              != TVG_RESULT_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to load Lottie JSON.\n");
++        return AVERROR_INVALIDDATA;
++    }
++
++    tvg_animation_get_total_frame(s->animation, &s->total_frames);
++    if (s->total_frames <= 0.f) {
++        av_log(avctx, AV_LOG_ERROR, "Animation has no frames.\n");
++        return AVERROR_INVALIDDATA;
++    }
++
++    tvg_picture_get_size(picture, &pic_w, &pic_h);
++    if (s->width  <= 0) s->width  = pic_w > 0.f ? (int)pic_w : avctx->width;
++    if (s->height <= 0) s->height = pic_h > 0.f ? (int)pic_h : avctx->height;
++    if (s->width <= 0 || s->height <= 0) {
++        av_log(avctx, AV_LOG_ERROR, "Cannot determine output dimensions.\n");
++        return AVERROR_INVALIDDATA;
++    }
++
++    ret = ff_set_dimensions(avctx, s->width, s->height);
++    if (ret < 0) {
++        av_log(avctx, AV_LOG_ERROR,
++               "Invalid output dimensions %dx%d.\n",s->width, s->height);
++        return ret;
++    }
++
++    if (tvg_picture_set_size(picture, (float)s->width, (float)s->height)
++                             != TVG_RESULT_SUCCESS)
++        av_log(avctx, AV_LOG_WARNING, "Failed to set picture size.\n");
++
++    s->canvas = tvg_swcanvas_create(TVG_ENGINE_OPTION_DEFAULT);
++    if (!s->canvas) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to create ThorVG SW canvas.\n");
++        return AVERROR(ENOMEM);
++    }
++
++    if (tvg_canvas_add(s->canvas, picture) != TVG_RESULT_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to add picture to canvas.\n");
++        tvg_canvas_destroy(s->canvas);
++        s->canvas = NULL;
++        return AVERROR_EXTERNAL;
++    }
++
++    return 0;
++}
++
++static int libthorvg_decode(AVCodecContext *avctx, AVFrame *frame,
++                            int *got_frame, AVPacket *pkt)
++{
++    LibThorVGContext *s = avctx->priv_data;
++    int frame_index;
++    int total_frames;
++    float anim_frame;
++    Tvg_Result r;
++    int ret;
++
++    frame_index = AV_RL32(pkt->data);
++
++    if (!s->canvas && (ret = libthorvg_canvas_init(avctx)) < 0)
++        return ret;
++
++    total_frames = FFMAX((int)s->total_frames, 1);
++    anim_frame = (float)(frame_index % total_frames);
++
++    r = tvg_animation_set_frame(s->animation, anim_frame);
++    if (r != TVG_RESULT_SUCCESS && r != TVG_RESULT_INSUFFICIENT_CONDITION) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to set animation frame %.2f.\n",
++               anim_frame);
++        return AVERROR_EXTERNAL;
++    }
++
++    if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
++        return ret;
++
++    r = tvg_swcanvas_set_target(s->canvas,
++                                (uint32_t *)frame->data[0],
++                                frame->linesize[0] / 4,
++                                avctx->width, avctx->height,
++                                TVG_COLORSPACE_ABGR8888S);
++    if (r != TVG_RESULT_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to set ThorVG canvas target.\n");
++        av_frame_unref(frame);
++        return AVERROR_EXTERNAL;
++    }
++
++    r = tvg_canvas_update(s->canvas);
++    if (r != TVG_RESULT_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to update ThorVG canvas.\n");
++        av_frame_unref(frame);
++        return AVERROR_EXTERNAL;
++    }
++
++    r = tvg_canvas_draw(s->canvas, true);
++    if (r != TVG_RESULT_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to draw ThorVG canvas.\n");
++        av_frame_unref(frame);
++        return AVERROR_EXTERNAL;
++    }
++
++    r = tvg_canvas_sync(s->canvas);
++    if (r != TVG_RESULT_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to sync ThorVG canvas.\n");
++        av_frame_unref(frame);
++        return AVERROR_EXTERNAL;
++    }
++
++    frame->pts       = pkt->pts;
++    frame->duration  = pkt->duration;
++    frame->pict_type = AV_PICTURE_TYPE_I;
++    frame->flags    |= AV_FRAME_FLAG_KEY;
++    *got_frame = 1;
++    return pkt->size;
++}
++
++static av_cold int libthorvg_close(AVCodecContext *avctx)
++{
++    LibThorVGContext *s = avctx->priv_data;
++
++    if (s->canvas) {
++        tvg_canvas_destroy(s->canvas);
++        s->canvas = NULL;
++    }
++    if (s->animation) {
++        tvg_animation_del(s->animation);
++        s->animation = NULL;
++    }
++    if (s->engine_initialized) {
++        tvg_engine_term();
++        s->engine_initialized = 0;
++    }
++    return 0;
++}
++
++#define OFFSET(x) offsetof(LibThorVGContext, x)
++#define DEC (AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_VIDEO_PARAM)
++static const AVOption libthorvg_options[] = {
++    { "width",  "output width override (0 = animation native)",
++      OFFSET(width),  AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, DEC },
++    { "height", "output height override (0 = animation native)",
++      OFFSET(height), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, DEC },
++    { NULL }
++};
++
++static const AVClass libthorvg_class = {
++    .class_name = "libthorvg",
++    .item_name  = av_default_item_name,
++    .option     = libthorvg_options,
++    .version    = LIBAVUTIL_VERSION_INT,
++};
++
++const FFCodec ff_libthorvg_decoder = {
++    .p.name         = "libthorvg",
++    CODEC_LONG_NAME("Lottie animation (ThorVG)"),
++    .p.priv_class   = &libthorvg_class,
++    .p.type         = AVMEDIA_TYPE_VIDEO,
++    .p.id           = AV_CODEC_ID_LOTTIE,
++    .p.capabilities = AV_CODEC_CAP_DR1,
++    .p.wrapper_name = "libthorvg",
++    .caps_internal  = FF_CODEC_CAP_AUTO_THREADS,
++    .priv_data_size = sizeof(LibThorVGContext),
++    .init           = libthorvg_init,
++    .close          = libthorvg_close,
++    FF_CODEC_DECODE_CB(libthorvg_decode),
++};
+-- 
+2.52.0
+
