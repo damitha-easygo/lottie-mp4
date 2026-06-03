@@ -23,6 +23,7 @@
 ARG EMSDK_VERSION=3.1.74
 ARG THORVG_REF=v1.0.5
 ARG X264_REF=stable
+ARG LIBVPX_REF=v1.13.1
 ARG FFMPEG_REF=release/8.1
 ARG FFMPEG_PATCH=0001-lottie-support.patch
 ARG CACHE_BUST=1
@@ -31,6 +32,7 @@ FROM emscripten/emsdk:${EMSDK_VERSION} AS build
 
 ARG THORVG_REF
 ARG X264_REF
+ARG LIBVPX_REF
 ARG FFMPEG_REF
 ARG FFMPEG_PATCH
 ARG CACHE_BUST
@@ -114,6 +116,34 @@ RUN meson setup builddir \
     && meson install -C builddir
 
 # ----------------------------------------------------------------------------
+# libvpx (VP9 encoder for WebM output, with alpha support via yuva420p)
+# ----------------------------------------------------------------------------
+# `generic-gnu` is the target libvpx uses for unknown/cross toolchains: it
+# disables all hand-written asm so everything goes through emcc. Single-
+# threaded (no pthread fan-out inside the encoder), but cflags carry -pthread
+# so the emitted objects share the atomics/bulk-memory feature set with the
+# rest of the link — otherwise emcc rejects the mixed-feature archive.
+RUN git clone --depth 1 --branch ${LIBVPX_REF} https://chromium.googlesource.com/webm/libvpx /src/libvpx
+WORKDIR /src/libvpx
+RUN emconfigure ./configure \
+        --prefix=${PREFIX} \
+        --target=generic-gnu \
+        --disable-vp8 \
+        --enable-vp9 \
+        --enable-vp9-highbitdepth \
+        --disable-multithread \
+        --disable-runtime-cpu-detect \
+        --enable-static \
+        --disable-shared \
+        --disable-examples \
+        --disable-tools \
+        --disable-docs \
+        --disable-unit-tests \
+        --extra-cflags="-O3 -pthread" \
+    && emmake make -j"$(nproc)" \
+    && emmake make install
+
+# ----------------------------------------------------------------------------
 # FFmpeg latest stable + Lottie patch
 # ----------------------------------------------------------------------------
 # CACHE_BUST is referenced so a bump on the host (via --build-arg
@@ -175,12 +205,17 @@ RUN emconfigure ./configure \
         --enable-swresample \
         --enable-avutil \
         --enable-libx264 \
+        --enable-libvpx \
         --enable-libthorvg \
         --enable-demuxer=lottie \
         --enable-decoder=libthorvg \
         --enable-encoder=libx264 \
+        --enable-encoder=libvpx_vp9 \
+        --enable-encoder=gif \
         --enable-muxer=mp4 \
         --enable-muxer=mov \
+        --enable-muxer=webm \
+        --enable-muxer=gif \
         --enable-protocol=file \
         --enable-protocol=pipe \
         --enable-bsf=h264_mp4toannexb \
@@ -192,6 +227,9 @@ RUN emconfigure ./configure \
         --enable-filter=pad \
         --enable-filter=color \
         --enable-filter=overlay \
+        --enable-filter=split \
+        --enable-filter=palettegen \
+        --enable-filter=paletteuse \
         --progs-suffix=.js \
         --extra-ldexeflags="-pthread \
                            -s WASM=1 \

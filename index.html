@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Lottie → MP4</title>
+  <title>Lottie → MP4 / WebM / GIF</title>
   <style>
     :root {
       font-family: system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
@@ -40,7 +40,8 @@
     label { font-size: 13px; padding-top: 6px; }
     input[type="number"],
     input[type="text"],
-    input[type="file"] {
+    input[type="file"],
+    select {
       font: inherit;
       padding: 6px 8px;
       border: 1px solid #ccc;
@@ -111,10 +112,11 @@
   </style>
 </head>
 <body>
-  <h1>Lottie → MP4</h1>
+  <h1>Lottie → MP4 / WebM / GIF</h1>
   <p class="sub">
-    Convert Lottie JSON animations to H.264 MP4 entirely in the browser.
-    Runs FFmpeg + ThorVG + libx264 compiled to WebAssembly. No upload.
+    Convert Lottie JSON animations to H.264 MP4, VP9 WebM, or GIF entirely in
+    the browser. Runs FFmpeg + ThorVG + libx264 + libvpx compiled to
+    WebAssembly. No upload.
   </p>
 
   <fieldset>
@@ -124,6 +126,17 @@
       <div>
         <input type="file" id="file" accept=".json,application/json">
         <div class="hint" id="fileHint">no file selected</div>
+      </div>
+    </div>
+    <div class="row">
+      <label for="format">Format</label>
+      <div>
+        <select id="format">
+          <option value="mp4">MP4 · H.264</option>
+          <option value="webm">WebM · VP9 (alpha)</option>
+          <option value="gif">GIF (alpha)</option>
+        </select>
+        <div class="hint">webm &amp; gif keep transparency · mp4 composites onto background</div>
       </div>
     </div>
     <div class="row">
@@ -155,21 +168,21 @@
           <input type="text" id="bgText" value="#000000" maxlength="7"
                  pattern="#?[0-9A-Fa-f]{6}" spellcheck="false">
         </div>
-        <div class="hint">mp4 has no alpha · transparency composited onto this</div>
+        <div class="hint">mp4 only · transparency composited onto this (webm/gif keep alpha)</div>
       </div>
     </div>
     <div class="row">
       <label for="crf">CRF</label>
       <div>
         <input type="number" id="crf" value="20" min="0" max="51">
-        <div class="hint">x264 quality · 0 lossless · 51 worst</div>
+        <div class="hint">mp4/webm quality · 0 best · 51 worst · ignored for gif</div>
       </div>
     </div>
   </fieldset>
 
   <fieldset>
     <legend>Encode</legend>
-    <button id="run" disabled>Encode MP4</button>
+    <button id="run" disabled>Encode</button>
     <span class="status" id="statusText">loading ffmpeg.wasm…</span>
   </fieldset>
 

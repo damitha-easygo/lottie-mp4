@@ -14,6 +14,7 @@
 #   FFMPEG_REF   default release/8.1 — latest FFmpeg stable release branch
 #   THORVG_REF   default v1.0.5
 #   X264_REF     default stable
+#   LIBVPX_REF   default v1.13.1
 #   OUT_DIR      default <repo root>
 #
 # By default each invocation bumps CACHE_BUST so the FFmpeg clone layer
@@ -40,6 +41,7 @@ BUILD_ARGS=(--build-arg "CACHE_BUST=$CACHE_BUST")
 [ -n "${FFMPEG_REF:-}" ] && BUILD_ARGS+=(--build-arg "FFMPEG_REF=$FFMPEG_REF")
 [ -n "${THORVG_REF:-}" ] && BUILD_ARGS+=(--build-arg "THORVG_REF=$THORVG_REF")
 [ -n "${X264_REF:-}"   ] && BUILD_ARGS+=(--build-arg "X264_REF=$X264_REF")
+[ -n "${LIBVPX_REF:-}" ] && BUILD_ARGS+=(--build-arg "LIBVPX_REF=$LIBVPX_REF")
 
 echo "==> Building to $OUT_DIR"
 mkdir -p "$OUT_DIR"

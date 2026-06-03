@@ -4956,6 +4956,10 @@ var __emscripten_thread_set_strongref = thread => {};
 // - keeping the "main" thread alive in PROXY_TO_PTHREAD mode;
 // - crashed threads that needs to propagate the uncaught exception
 //   back to the main thread.
+var __emscripten_throw_longjmp = () => {
+  throw Infinity;
+};
+
 function __gmtime_js(time_low, time_high, tmPtr) {
   var time = convertI32PairToI53Checked(time_low, time_high);
   var date = new Date(time * 1e3);
@@ -5544,6 +5548,7 @@ function assignWasmImports() {
     /** @export */ _emscripten_thread_cleanup: __emscripten_thread_cleanup,
     /** @export */ _emscripten_thread_mailbox_await: __emscripten_thread_mailbox_await,
     /** @export */ _emscripten_thread_set_strongref: __emscripten_thread_set_strongref,
+    /** @export */ _emscripten_throw_longjmp: __emscripten_throw_longjmp,
     /** @export */ _gmtime_js: __gmtime_js,
     /** @export */ _localtime_js: __localtime_js,
     /** @export */ _mktime_js: __mktime_js,
@@ -5566,6 +5571,17 @@ function assignWasmImports() {
     /** @export */ fd_read: _fd_read,
     /** @export */ fd_seek: _fd_seek,
     /** @export */ fd_write: _fd_write,
+    /** @export */ invoke_i,
+    /** @export */ invoke_ii,
+    /** @export */ invoke_iii,
+    /** @export */ invoke_iiii,
+    /** @export */ invoke_iiiiiiiii,
+    /** @export */ invoke_iiiijj,
+    /** @export */ invoke_vi,
+    /** @export */ invoke_vii,
+    /** @export */ invoke_viii,
+    /** @export */ invoke_viiii,
+    /** @export */ invoke_viiiiii,
     /** @export */ memory: wasmMemory
   };
 }
@@ -5604,6 +5620,8 @@ var __emscripten_thread_exit = createExportWrapper("_emscripten_thread_exit", 1)
 
 var __emscripten_check_mailbox = createExportWrapper("_emscripten_check_mailbox", 0);
 
+var _setThrew = createExportWrapper("setThrew", 2);
+
 var __emscripten_tempret_set = createExportWrapper("_emscripten_tempret_set", 1);
 
 var _emscripten_stack_init = () => (_emscripten_stack_init = wasmExports["emscripten_stack_init"])();
@@ -5630,9 +5648,134 @@ var dynCall_viiiij = Module["dynCall_viiiij"] = createExportWrapper("dynCall_vii
 
 var dynCall_viiij = Module["dynCall_viiij"] = createExportWrapper("dynCall_viiij", 6);
 
+var dynCall_iiiijj = Module["dynCall_iiiijj"] = createExportWrapper("dynCall_iiiijj", 8);
+
+var dynCall_iiijiii = Module["dynCall_iiijiii"] = createExportWrapper("dynCall_iiijiii", 8);
+
 var dynCall_iij = Module["dynCall_iij"] = createExportWrapper("dynCall_iij", 4);
 
 var dynCall_jii = Module["dynCall_jii"] = createExportWrapper("dynCall_jii", 3);
+
+function invoke_vii(index, a1, a2) {
+  var sp = stackSave();
+  try {
+    getWasmTableEntry(index)(a1, a2);
+  } catch (e) {
+    stackRestore(sp);
+    if (e !== e + 0) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_iii(index, a1, a2) {
+  var sp = stackSave();
+  try {
+    return getWasmTableEntry(index)(a1, a2);
+  } catch (e) {
+    stackRestore(sp);
+    if (e !== e + 0) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_vi(index, a1) {
+  var sp = stackSave();
+  try {
+    getWasmTableEntry(index)(a1);
+  } catch (e) {
+    stackRestore(sp);
+    if (e !== e + 0) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_iiiiiiiii(index, a1, a2, a3, a4, a5, a6, a7, a8) {
+  var sp = stackSave();
+  try {
+    return getWasmTableEntry(index)(a1, a2, a3, a4, a5, a6, a7, a8);
+  } catch (e) {
+    stackRestore(sp);
+    if (e !== e + 0) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_viiii(index, a1, a2, a3, a4) {
+  var sp = stackSave();
+  try {
+    getWasmTableEntry(index)(a1, a2, a3, a4);
+  } catch (e) {
+    stackRestore(sp);
+    if (e !== e + 0) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_iiii(index, a1, a2, a3) {
+  var sp = stackSave();
+  try {
+    return getWasmTableEntry(index)(a1, a2, a3);
+  } catch (e) {
+    stackRestore(sp);
+    if (e !== e + 0) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_viii(index, a1, a2, a3) {
+  var sp = stackSave();
+  try {
+    getWasmTableEntry(index)(a1, a2, a3);
+  } catch (e) {
+    stackRestore(sp);
+    if (e !== e + 0) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_i(index) {
+  var sp = stackSave();
+  try {
+    return getWasmTableEntry(index)();
+  } catch (e) {
+    stackRestore(sp);
+    if (e !== e + 0) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_ii(index, a1) {
+  var sp = stackSave();
+  try {
+    return getWasmTableEntry(index)(a1);
+  } catch (e) {
+    stackRestore(sp);
+    if (e !== e + 0) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_viiiiii(index, a1, a2, a3, a4, a5, a6) {
+  var sp = stackSave();
+  try {
+    getWasmTableEntry(index)(a1, a2, a3, a4, a5, a6);
+  } catch (e) {
+    stackRestore(sp);
+    if (e !== e + 0) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_iiiijj(index, a1, a2, a3, a4, a5, a6, a7) {
+  var sp = stackSave();
+  try {
+    return dynCall_iiiijj(index, a1, a2, a3, a4, a5, a6, a7);
+  } catch (e) {
+    stackRestore(sp);
+    if (e !== e + 0) throw e;
+    _setThrew(1, 0);
+  }
+}
 
 // include: postamble.js
 // === Auto-generated postamble setup entry stuff ===

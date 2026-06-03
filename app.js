@@ -100,7 +100,7 @@
   // Each encode gets a fresh Module: EXIT_RUNTIME=0 means main() cannot be
   // safely re-entered on the same heap. The wasm binary is browser-cached
   // after the first fetch.
-  async function encodeOnce({ inputBytes, args }) {
+  async function encodeOnce({ inputBytes, args, outName }) {
     let exitResolver = null;
     const finished = new Promise((resolve) => { exitResolver = resolve; });
 
@@ -133,7 +133,7 @@
     if (r.abort) logAppend("Abort: " + r.abort);
 
     let out = null;
-    try { out = M.FS.readFile("output.mp4"); } catch (_) {}
+    try { out = M.FS.readFile(outName); } catch (_) {}
     return { exitCode: r.code, data: out };
   }
 
@@ -148,15 +148,52 @@
     const fps = +$("fps").value | 0;
     const crf = +$("crf").value | 0;
     const bg  = validHex(bgText.value) ? normHex(bgText.value) : "#000000";
+    const fmt = $("format").value;
     const inputBytes = pickedBytes;
 
-    // Two-stage filter graph: a solid color source sits under the rgba
-    // Lottie so transparency is composited onto `bg` before we drop alpha
-    // for yuv420p. `shortest=1` clips the (otherwise infinite) color
-    // source to the length of the Lottie.
-    const filterGraph =
-      `color=c=${bg}:s=${w}x${h}:r=${fps}[bg];` +
-      `[bg][0:v]overlay=shortest=1:format=auto,format=yuv420p[out]`;
+    // Per-format filter graph + codec settings. MP4 has no alpha, so the
+    // rgba Lottie is composited over a solid `color` source (clipped to the
+    // animation length with shortest=1) then flattened to yuv420p. WebM (VP9)
+    // and GIF both carry transparency, so they skip the background and keep
+    // the alpha channel instead.
+    let outName, mimeType, codecLabel, isImage;
+    let filterGraph, codecArgs;
+
+    if (fmt === "webm") {
+      outName = "output.webm"; mimeType = "video/webm";
+      codecLabel = "vp9"; isImage = false;
+      // yuva420p preserves alpha through the VP9 encoder.
+      filterGraph = `[0:v]format=yuva420p[out]`;
+      codecArgs = [
+        "-c:v", "libvpx-vp9",
+        "-pix_fmt", "yuva420p",
+        "-crf", String(crf), "-b:v", "0",
+        "-deadline", "good", "-cpu-used", "4",
+      ];
+    } else if (fmt === "gif") {
+      outName = "output.gif"; mimeType = "image/gif";
+      codecLabel = "gif"; isImage = true;
+      // Generate an optimal palette (reserving a slot for transparency) and
+      // apply it with 1-bit alpha so the GIF keeps the Lottie's transparency.
+      filterGraph =
+        `[0:v]split[a][b];` +
+        `[a]palettegen=reserve_transparent=1[p];` +
+        `[b][p]paletteuse=alpha_threshold=128[out]`;
+      codecArgs = ["-c:v", "gif"];
+    } else {
+      outName = "output.mp4"; mimeType = "video/mp4";
+      codecLabel = "h.264"; isImage = false;
+      filterGraph =
+        `color=c=${bg}:s=${w}x${h}:r=${fps}[bg];` +
+        `[bg][0:v]overlay=shortest=1:format=auto,format=yuv420p[out]`;
+      codecArgs = [
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", String(crf),
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+      ];
+    }
 
     const args = [
       "-y",
@@ -166,24 +203,20 @@
       "-filter_complex", filterGraph,
       "-map", "[out]",
       "-r", String(fps),
-      "-c:v", "libx264",
-      "-preset", "ultrafast",
-      "-crf", String(crf),
-      "-pix_fmt", "yuv420p",
-      "-movflags", "+faststart",
-      "output.mp4",
+      ...codecArgs,
+      outName,
     ];
 
     runBtn.disabled = true;
     resultEl.innerHTML  = "";
     logReset();
     logAppend("$ ffmpeg " + args.join(" "));
-    setStatus(`encoding · ${w}×${h} · ${fps} fps · crf ${crf}`, true);
+    setStatus(`encoding · ${codecLabel} · ${w}×${h} · ${fps} fps`, true);
 
     const t0 = performance.now();
     let result = null;
     try {
-      result = await encodeOnce({ inputBytes, args });
+      result = await encodeOnce({ inputBytes, args, outName });
     } catch (e) {
       logAppend("Exception: " + (e && e.stack ? e.stack : e));
     }
@@ -191,27 +224,37 @@
 
     const data = result && result.data;
     if (data && data.length > 0) {
-      const blob = new Blob([data.buffer], { type: "video/mp4" });
+      const blob = new Blob([data.buffer], { type: mimeType });
       const url  = URL.createObjectURL(blob);
 
-      const video = document.createElement("video");
-      video.src = url;
-      video.controls = true;
-      video.autoplay = true;
-      video.loop = true;
-      video.muted = true;
+      let preview;
+      if (isImage) {
+        preview = document.createElement("img");
+        preview.src = url;
+        preview.style.maxWidth = "100%";
+        preview.style.display = "block";
+        preview.style.marginBottom = "10px";
+      } else {
+        preview = document.createElement("video");
+        preview.src = url;
+        preview.controls = true;
+        preview.autoplay = true;
+        preview.loop = true;
+        preview.muted = true;
+      }
 
+      const ext = outName.slice(outName.lastIndexOf("."));
       const dl = document.createElement("a");
       dl.className = "download";
       dl.href = url;
-      dl.download = ((pickedName || "lottie").replace(/\.json$/i, "")) + ".mp4";
+      dl.download = ((pickedName || "lottie").replace(/\.json$/i, "")) + ext;
       dl.textContent = `Download ${dl.download}`;
 
       const meta = document.createElement("span");
       meta.className = "meta";
-      meta.textContent = `${(data.length / 1024).toFixed(1)} KB · h.264 · ${w}×${h} · ${dt}s`;
+      meta.textContent = `${(data.length / 1024).toFixed(1)} KB · ${codecLabel} · ${w}×${h} · ${dt}s`;
 
-      resultEl.appendChild(video);
+      resultEl.appendChild(preview);
       resultEl.appendChild(dl);
       resultEl.appendChild(meta);
 
