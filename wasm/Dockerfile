@@ -102,7 +102,7 @@ RUN meson setup builddir \
         --default-library=static \
         --buildtype=release \
         -Dengines=cpu \
-        -Dloaders=lottie \
+        -Dloaders=all \
         -Dthreads=false \
         -Dbindings=capi \
         -Dstatic=true \

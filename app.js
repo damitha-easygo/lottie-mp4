@@ -161,6 +161,7 @@
     const args = [
       "-y",
       "-c:v", "libthorvg", "-width", String(w), "-height", String(h),
+      "-f", "lottie",
       "-i", "input.json",
       "-filter_complex", filterGraph,
       "-map", "[out]",
